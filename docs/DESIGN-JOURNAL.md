@@ -99,3 +99,13 @@ The recurring anti-pattern the review caught: **soft (prompt-level) guarantees d
 Hard-delete/orphan-row reconciliation (mark-and-sweep), a PII-free agent view, and >250 nested pagination — all safe to skip at dev-store scale, all written down in spec §11 so a demo isn't caught off guard.
 
 The lesson worth saying out loud in the interview: **the design was structurally sound, but its guarantees were being asserted a layer higher than they were enforced.** The fix wasn't more features — it was pushing each guarantee down to where it's mechanically true.
+
+## 11. Bringing it live — what the real store taught us
+
+Wiring the code to a real dev store surfaced three things the design docs couldn't, each with a clean resolution:
+
+- **Shopify gates customer PII on dev/free plans.** The Customer object (and `order.email`) returns `ACCESS_DENIED` unless the store is on a paid plan. Rather than fight it, we dropped the PII fields from the queries and made customer sync non-fatal (skip if the whole object is denied). The upside: the pipeline is now **genuinely PII-free** — the exact hardening we'd deferred in spec §11 arrived for free, enforced by Shopify itself.
+- **Sample-data generators create *draft* orders, not orders.** With only drafts present, `ordersCount` was 0 and the sync correctly stored **zero revenue**. This is the "no hallucinated numbers" principle proving itself in the wild: a draft is an unpaid quote, so the system refused to invent revenue from it. Real orders (drafts marked as paid) flowed in immediately after. Worth demoing as a feature, not apologising for as a gap.
+- **Integration tests must never run against the production DB by default.** The metric test does `delete from orders` to seed known fixtures; under vitest's *parallel* runner the three DB suites raced and — pointed at the real `SUPABASE_DB_URL` — would wipe live data on a plain `npm test`. Fixed by gating the destructive suites behind `RUN_DB_TESTS=1` and a serial `npm run test:db`; `npm test` is now the safe, non-destructive unit suite. A reminder that "it passed once" hid both a **concurrency race** and a **blast-radius** problem.
+
+Final verified state (against the live store): 17 products, 26 variants, 5 paid orders, 7 line items sync idempotently (re-run leaves counts flat); the report reconciles to `$8450.34`; the `supabase_read_only_user` role can read every metric view and execute the window functions, so the read-only agent path is grant-ready.
