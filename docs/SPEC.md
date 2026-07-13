@@ -155,7 +155,8 @@ The `store-analyst` agent: (1) refreshes data by running the sync — its Bash i
 - **Read path (agent):** Supabase MCP hosted server via **OAuth** — the teammate logs in once in the browser; **no key stored anywhere**. `.mcp.json` holds only the non-secret `project_ref` + `read_only=true`, so it is safe to commit and "just works" when the repo is opened.
 - **Agent Bash is allow-listed** to exactly `npm run sync` (± `--force`). Combined with the read-only MCP role, the agent genuinely cannot write to the DB — it can only *trigger* the reviewed ETL. This closes the "read-only agent secretly holds a write path" hole raised in review.
 - **Shopify scopes:** the custom app requests `read_products`, `read_orders`, `read_all_orders` (for >60-day history), `read_customers`. Documented in `.env.example`/README so setup is explicit.
-- **PII:** we store customer email/name because it is fake dev-store data; documented and easy to drop. (A stricter PII-free read view for the agent is noted as a future hardening in §11.)
+- **Row Level Security:** RLS is enabled (no policies) on every table and the metric views are `security_invoker` (`0003_rls.sql`), so the PostgREST roles (`anon`/`authenticated`, reachable via the publishable key) are denied all access. The only readers are the ETL/report (owner `postgres`) and the agent (`supabase_read_only_user`, which has `pg_read_all_data` + `BYPASSRLS`). Verified: `anon` is hard-denied, the agent still returns identical numbers.
+- **PII:** dev/free Shopify plans deny the Customer object's PII outright, so the pipeline stores no customer email/names and no order email — it is PII-free in practice (columns remain, always `NULL`).
 - **MCP caveats (from research):** headless PAT fallback is account-wide; prompt-injection is the top residual risk. Mitigated via OAuth + read-only role + agent injection guardrail.
 
 ## 8. Error handling & reliability
@@ -184,7 +185,7 @@ Applied from the adversarial review (`docs/design-review-grill.md`): metric view
 
 **Deferred as documented limitations (safe at dev-store scale):**
 - **Hard-delete reconciliation (orphan rows).** An order/product deleted in Shopify lingers in Supabase and would still be counted. Deferred; the clean fix is a mark-and-sweep (stamp a `seen` marker each full sync, soft-delete rows not seen). Called out so a demo isn't surprised.
-- **PII-free agent view.** The agent can currently `SELECT` customer email/name; a dedicated PII-free view for the read-only role is the stricter posture. Deferred (fake dev data).
+- ~~**PII-free agent view.**~~ **Resolved during the live run:** the dev-store plan denies customer PII at the source (so nothing sensitive is stored), and RLS + `security_invoker` views (`0003_rls.sql`) deny the `anon`/`authenticated` REST roles entirely. The exposure this item worried about is closed.
 - **Nested pagination > 250.** A single product with >250 variants or a single order with >250 line items is not sub-paginated. Deferred — unreachable at dev-store scale; noted so it isn't mistaken for handled.
 
 **Trade-offs we keep:**
