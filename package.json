@@ -8,6 +8,7 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:db": "RUN_DB_TESTS=1 vitest run --no-file-parallelism int.test",
     "migrate": "tsx src/cli/migrate.ts",
     "sync": "tsx src/cli/sync.ts",
     "report": "tsx src/cli/report.ts"

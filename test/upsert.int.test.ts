@@ -6,7 +6,9 @@ import { runMigrations } from "../src/db/migrate.js";
 import { upsertAll } from "../src/db/upsert.js";
 import type { SyncData } from "../src/types.js";
 
-const hasDb = !!process.env.SUPABASE_DB_URL;
+// Destructive DB tests: opt-in only (they mutate whatever SUPABASE_DB_URL points at).
+// Run with: RUN_DB_TESTS=1 npm run test:db  (ideally against a scratch database).
+const hasDb = process.env.RUN_DB_TESTS === "1" && !!process.env.SUPABASE_DB_URL;
 
 describe.skipIf(!hasDb)("upsertAll (integration)", () => {
   // Pool creation is deferred to beforeAll (not evaluated at describe-body scope):

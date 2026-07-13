@@ -5,7 +5,9 @@ import { getPool } from "../src/db/pool.js";
 import { runMigrations } from "../src/db/migrate.js";
 import { getWeeklyMetrics } from "../src/db/metrics.js";
 
-const hasDb = !!process.env.SUPABASE_DB_URL;
+// Destructive DB tests: opt-in only (they mutate whatever SUPABASE_DB_URL points at).
+// Run with: RUN_DB_TESTS=1 npm run test:db  (ideally against a scratch database).
+const hasDb = process.env.RUN_DB_TESTS === "1" && !!process.env.SUPABASE_DB_URL;
 
 describe.skipIf(!hasDb)("metric layer (integration)", () => {
   // Pool creation deferred to beforeAll: describe.skipIf still runs the factory body

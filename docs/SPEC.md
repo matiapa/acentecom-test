@@ -2,7 +2,6 @@
 
 - **Date:** 2026-07-11
 - **Status:** Approved (design), revised — hardened after adversarial review (`docs/design-review-grill.md`)
-- **Owner:** Andini (AI Developer assignment)
 
 > A running narrative of *why* each choice was made lives in `docs/DESIGN-JOURNAL.md` (for the interviewer). This spec is the *what*. The adversarial grilling that shaped this revision is in `docs/design-review-grill.md`.
 
