@@ -44,7 +44,6 @@ create or replace view weekly_metrics as
        join orders_valid ov on ov.shopify_id = li.order_id
       where ov.created_at <@ store_week_range()) as units_sold;
 
--- Ensure the Supabase read-only roles can read our objects (idempotent).
-grant usage on schema public to anon, authenticated;
-grant select on all tables in schema public to anon, authenticated;
-alter default privileges in schema public grant select on tables to anon, authenticated;
+-- Note: the Supabase MCP read-only role (supabase_read_only_user) already reads
+-- every object via its pg_read_all_data membership + BYPASSRLS, so no grants to
+-- anon/authenticated are needed here. Access hardening (RLS) lives in 0003_rls.sql.
