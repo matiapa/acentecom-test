@@ -78,3 +78,24 @@ Subtlety worth calling out at the interview: the read-only agent now **orchestra
 - Whether to keep customer PII or store only anonymized ids.
 - Whether to add incremental (`updated_at_min`) sync and hard-delete reconciliation for a larger catalog.
 - Whether the report should eventually be wired to a real schedule (it is cron-ready but not scheduled here).
+
+## 10. Adversarial self-review — grilling the design before writing code
+
+Before implementation we ran a deliberately hostile design review (an Opus subagent playing a demanding technical interviewer; full transcript in `docs/design-review-grill.md`). It posed **33 challenges** and surfaced **14 real gaps**. The single most important finding reframed the whole "no hallucinated numbers" claim:
+
+> **Provenance was hard-enforced, but semantic correctness was only soft-enforced.** The agent physically cannot invent a number (read-only role), but it *could* return a real number that answers the *wrong question* — e.g. a rolling-7-day UTC "this week" instead of the report's Monday-anchored, timezone-aware week, or revenue that ignores refunds. A number can be truthfully queried and still be wrong.
+
+The recurring anti-pattern the review caught: **soft (prompt-level) guarantees dressed up as hard (schema/credential-level) ones** — window definitions "copied into the agent's instructions," the injection guardrail, and the read-only-agent story (which leaked because the agent had general Bash and thus the ETL's write path).
+
+### What we changed (recommended triage applied)
+- **Metric layer moved into the database.** Windows and revenue are now SQL **views/functions** (`store_week_range()`, `orders_valid`, `weekly_metrics`, …) that *both* the report and the agent query. Semantic correctness becomes hard-enforced — the agent can't drift to a different window/currency. This one move closed four gaps at once.
+- **Revenue nets refunds and excludes test/cancelled orders**, so it reconciles with the Shopify admin (added `total_refunded`, `test`).
+- **Single-currency assertion** + storing `shopMoney` — no more summing incomparable money.
+- **Agent Bash allow-listed to exactly `npm run sync`** — the "read-only agent" claim is now actually true; it can trigger the trusted ETL but nothing else.
+- **Sync serialized + transactional** — advisory lock kills the check-then-act freshness race; `last_synced_at` is stamped only on success, so a partial failure can't masquerade as fresh.
+- **`read_all_orders` scope** documented; if absent, history is labelled "last 60 days" instead of silently truncated.
+
+### What we consciously deferred (documented, not forgotten)
+Hard-delete/orphan-row reconciliation (mark-and-sweep), a PII-free agent view, and >250 nested pagination — all safe to skip at dev-store scale, all written down in spec §11 so a demo isn't caught off guard.
+
+The lesson worth saying out loud in the interview: **the design was structurally sound, but its guarantees were being asserted a layer higher than they were enforced.** The fix wasn't more features — it was pushing each guarantee down to where it's mechanically true.

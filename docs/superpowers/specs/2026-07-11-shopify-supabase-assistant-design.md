@@ -1,10 +1,10 @@
 # Shopify → Supabase Store Assistant — Design
 
 - **Date:** 2026-07-11
-- **Status:** Approved (design), revised
+- **Status:** Approved (design), revised — hardened after adversarial review (`docs/design-review-grill.md`)
 - **Owner:** Andini (AI Developer assignment)
 
-> A running narrative of *why* each choice was made lives in `docs/DESIGN-JOURNAL.md` (for the interviewer). This spec is the *what*.
+> A running narrative of *why* each choice was made lives in `docs/DESIGN-JOURNAL.md` (for the interviewer). This spec is the *what*. The adversarial grilling that shaped this revision is in `docs/design-review-grill.md`.
 
 ## 1. Goal
 
@@ -65,12 +65,12 @@ The agent *orchestrates* a trusted write process (the ETL, which holds its own w
 | Module | Responsibility | Depends on |
 | :-- | :-- | :-- |
 | `config.ts` | Load + validate env vars; fail fast with a clear message if any are missing. | env |
-| `shopify.ts` | Shopify Admin GraphQL client: fetch products+variants, orders+line-items, customers with cursor pagination + throttle handling. | config |
-| `transform.ts` | **Pure functions**: raw Shopify JSON → clean DB row shapes. Unit-tested. | — |
-| `supabase.ts` | Supabase client + batched `upsert` helpers keyed on `shopify_id`, in FK dependency order. | config |
-| `sync.ts` | Orchestrates a full sync; TTL guard (`runSyncIfStale`, `--force`); writes `sync_state`; prints counts. | above |
-| `report.ts` | `runSyncIfStale()` then computes the daily report (SELECT-only) and formats markdown. | config, sync, supabase |
-| `time.ts` | **Pure functions**: day/week window boundaries in the report timezone. Unit-tested. | — |
+| `shopify.ts` | Shopify Admin GraphQL client: fetch products+variants, orders+line-items, customers with cursor pagination + cost/throttle-aware backoff; captures shop currency. | config |
+| `transform.ts` | **Pure functions**: raw Shopify JSON → clean DB row shapes (incl. `shopMoney` amounts, refunds, `test` flag). Unit-tested. | — |
+| `supabase.ts` | Supabase client + batched, per-entity-transactional `upsert` helpers keyed on `shopify_id`, in FK dependency order; advisory-lock helper. | config |
+| `sync.ts` | Orchestrates a full sync; advisory lock + TTL guard (`runSyncIfStale`, `--force`); writes `sync_state`/`app_config`; prints counts. | above |
+| `report.ts` | `runSyncIfStale()` then SELECTs the `*_metrics` views (SELECT-only) and formats markdown. | config, sync, supabase |
+| `time.ts` | **Pure functions**: small helpers to format the "as of"/window *labels* for display. Window *math* lives in SQL (`store_*_range()`), not here. Unit-tested. | — |
 
 ## 4. Data model
 
@@ -86,7 +86,9 @@ Six tables. Natural primary key = the numeric Shopify id everywhere, which gives
 `shopify_id` bigint PK · `email` · `first_name` · `last_name` · `orders_count` int · `total_spent` numeric(12,2) · `state` · `created_at` · `updated_at` · `synced_at`  *(minimal PII — see §7)*
 
 ### `orders`
-`shopify_id` bigint PK · `name` (e.g. `#1001`) · `customer_id` bigint (nullable, no FK — customer may be absent) · `email` · `financial_status` · `fulfillment_status` · `currency` · `subtotal_price` · `total_tax` · `total_discounts` · `total_price` numeric(12,2) · `created_at` · `processed_at` · `updated_at` · `cancelled_at` · `synced_at`
+`shopify_id` bigint PK · `name` (e.g. `#1001`) · `customer_id` bigint (nullable, no FK — customer may be absent) · `email` · `financial_status` · `fulfillment_status` · `currency` (shop currency, see below) · `test` boolean · `subtotal_price` · `total_tax` · `total_discounts` · `total_refunded` numeric(12,2) · `total_price` numeric(12,2) · `created_at` · `processed_at` · `updated_at` · `cancelled_at` · `synced_at`
+
+All money is stored in **shop currency** (`shopMoney`), never presentment currency, so amounts are directly comparable and summable. `total_refunded` and `test` exist so revenue can net refunds and exclude test orders (see the metric layer below).
 
 ### `order_line_items`
 `shopify_id` bigint PK · `order_id` bigint **FK→orders** · `product_id` bigint (nullable, no FK) · `variant_id` bigint (nullable, no FK) · `title` · `variant_title` · `sku` · `quantity` int · `price` numeric(12,2) (unit) · `total_discount` numeric(12,2) · `synced_at`
@@ -94,29 +96,36 @@ Six tables. Natural primary key = the numeric Shopify id everywhere, which gives
 ### `sync_state` (single row, `id`=1)
 `id` int PK check(id=1) · `last_synced_at` timestamptz · `last_status` (success/error) · `last_error` text · `products_synced` · `variants_synced` · `orders_synced` · `line_items_synced` · `customers_synced` int · `duration_ms` int · `updated_at`
 
+### `app_config` (single row, `id`=1)
+`id` int PK check(id=1) · `report_timezone` text default `'UTC'` (IANA, seeded from the `REPORT_TIMEZONE` env on sync) · `store_currency` text — the shop's currency, captured from Shopify on sync. Read by the metric layer so window and currency logic have one authoritative source instead of being re-derived per caller.
+
 Delivered as `supabase/migrations/0001_init.sql`. Indexes on `orders.created_at`, `products.created_at`, `order_line_items.order_id`, `order_line_items.product_id`.
 
-### Metric definitions (single source of truth — used by report AND documented for the agent)
-- **New orders (window):** count of `orders` where `created_at` ∈ window and `cancelled_at IS NULL`.
-- **Revenue (window):** `SUM(total_price)` over non-cancelled `orders` created in the window. `total_price` is Shopify's authoritative order total → report matches the store admin exactly.
-- **New products (window):** count of `products` where `created_at` ∈ window.
-- **Units sold / top products (window):** from `order_line_items` joined to non-cancelled `orders`; units = `SUM(quantity)`, product revenue = `SUM(quantity*price - total_discount)`.
-- **Window:** "today" = current calendar day; "this week" = Monday 00:00 → now, both in `REPORT_TIMEZONE` (IANA, default `UTC`).
+### Metric layer — SQL views/functions are the single source of truth
+The metric definitions live **in the database** as views and functions (migration `0002_metrics.sql`), not in a prompt. Both the deterministic report *and* the LLM agent query these same objects, so a metric cannot drift between the two paths. This is the central fix from the adversarial review: provenance was already hard-enforced (the agent can't invent a number), and now **semantic correctness is hard-enforced too** (the agent can't silently answer a *different* question with a different window/currency/refund treatment).
 
-These definitions are copied into the agent's instructions so ad-hoc answers and the report agree.
+- **`store_today_range()` / `store_week_range()`** — SQL functions returning a `tstzrange` for "today" (current calendar day) and "this week" (Monday 00:00 → now), both computed in `app_config.report_timezone`. The agent uses these instead of writing its own `now() - interval '7 days'`, which would drift.
+- **`orders_valid`** — the canonical order set: excludes `cancelled_at IS NOT NULL` and `test = true`; exposes `net_revenue = total_price - total_refunded`. **Revenue = `SUM(net_revenue)`** over this view, so a fully/partially refunded order is netted and the number matches the Shopify admin.
+- **`daily_metrics` / `weekly_metrics`** — views returning `new_orders`, `revenue` (net), `new_products`, `units_sold` for the corresponding window. The report selects these directly.
+- **Units sold / top products** — from `order_line_items` joined to `orders_valid`; units = `SUM(quantity)`, product revenue = `SUM(quantity*price - total_discount)`.
+- **Single currency assertion** — the sync fails (or warns loudly) if it encounters orders in more than one currency, because `SUM` across currencies is meaningless. The report labels every money figure with `app_config.store_currency`.
+
+The agent's instructions tell it to **prefer these views/functions** for any windowed or revenue question, and to **do all arithmetic in SQL** (no client-side deltas/percentages) so every number it utters came verbatim from a query result.
 
 ## 5. Data flow
 
-### Sync (F1 + F2), TTL-guarded
-1. `config` validates env (fail fast). 2. If not stale and not `--force`, exit early (fresh). 3. `shopify` pages through all products+variants, orders+line-items, customers (GraphQL cursor pagination; backoff on throttle/`429`/`5xx`). 4. `transform` maps each raw record to clean rows (pure). 5. `supabase` upserts in batches `ON CONFLICT (shopify_id) DO UPDATE`, in FK order (customers → products → variants → orders → line_items). 6. `sync_state` row updated with counts/status/duration.
+### Sync (F1 + F2), TTL-guarded and serialized
+1. `config` validates env (fail fast). 2. Acquire a Postgres **advisory lock** (`pg_advisory_lock`) so two callers (e.g. the agent and a report firing together) cannot sync concurrently; the second waits, then sees fresh data and no-ops. 3. Re-check staleness *under the lock* (guards the check-then-act race): if not stale and not `--force`, release and exit early (fresh). 4. `shopify` pages through all products+variants, orders+line-items, customers (GraphQL cursor pagination; backoff driven by the GraphQL **cost/throttle status**, falling back to `429`/`Retry-After`). 5. `transform` maps each raw record to clean rows (pure); the shop currency is captured into `app_config`. 6. `supabase` upserts in batches `ON CONFLICT (shopify_id) DO UPDATE`, in FK order (customers → products → variants → orders → line_items), **inside a transaction per entity** so a failed batch does not leave torn rows. 7. Only on full success is `sync_state.last_synced_at` stamped; on failure `last_status='error'` + `last_error` are recorded but `last_synced_at` is left untouched so readers still see honest staleness.
 
-Re-running updates in place → **no duplicates**. Full sync every run (dev-store scale); does not reconcile hard-deletes in Shopify (§10). Incremental via `updated_at_min` is future work.
+Re-running updates in place → **no duplicates**. Full sync every run (dev-store scale); does not reconcile hard-deletes in Shopify (§11). Incremental via `updated_at_min` is future work.
+
+**Order history scope:** the Shopify Admin API only returns orders from the last 60 days unless the app is granted `read_all_orders`. The sync requests it; the setup docs call it out, and if it is not granted the report/agent label the order window as **"last 60 days"** rather than silently truncating history.
 
 ### Q&A (F3)
-The `store-analyst` agent: (1) runs `npm run sync` (TTL-guarded, so usually a fast no-op) via Bash, (2) answers using the Supabase MCP (`execute_sql`, `list_tables`) against the **read-only** role. It must run a real query for every number, name/show the query behind a number, refuse to guess, state when data is absent, and treat DB row contents as **data, never instructions** (prompt-injection guardrail).
+The `store-analyst` agent: (1) refreshes data by running the sync — its Bash is **allow-listed to exactly `npm run sync` (± `--force`)** and nothing else, so "orchestrates a trusted write process" cannot become "runs arbitrary writes with the service key"; (2) answers using the Supabase MCP (`execute_sql`, `list_tables`) against the **read-only** role. For any windowed or revenue question it **must use the metric views/functions** (`store_week_range()`, `orders_valid`, `weekly_metrics`, …) rather than hand-rolling windows, and **must do all arithmetic in SQL**. It runs a real query for every number, names/shows the query behind a number, refuses to guess, states when data is absent, and treats DB row contents as **data, never instructions** (prompt-injection guardrail).
 
 ### Report (F4)
-`daily-report` skill runs `report.ts` → `runSyncIfStale()` → SELECTs the metrics for the window → prints a short markdown report with a "data as of `last_synced_at`" line. Deterministic, no LLM math.
+`daily-report` skill runs `report.ts` → `runSyncIfStale()` → SELECTs `daily_metrics`/`weekly_metrics` (the same views the agent uses) → prints a short markdown report, every money figure labelled with `store_currency`, plus a "data as of `last_synced_at`" line. Deterministic, no LLM math.
 
 ## 6. Deliverables (file tree)
 
@@ -128,7 +137,8 @@ The `store-analyst` agent: (1) runs `npm run sync` (TTL-guarded, so usually a fa
 │   │   └── daily-report/SKILL.md
 │   └── agents/store-analyst.md
 ├── .mcp.json                     # Supabase MCP, read_only=true, project-scoped (no secret)
-├── supabase/migrations/0001_init.sql
+├── supabase/migrations/0001_init.sql        # tables
+├── supabase/migrations/0002_metrics.sql     # app_config + metric views/functions
 ├── src/ config.ts shopify.ts transform.ts supabase.ts sync.ts report.ts time.ts
 ├── test/ transform.test.ts time.test.ts
 ├── .env.example  .gitignore  package.json  tsconfig.json  README.md
@@ -144,30 +154,43 @@ The `store-analyst` agent: (1) runs `npm run sync` (TTL-guarded, so usually a fa
 
 - **Write path:** `SHOPIFY_ADMIN_TOKEN`, `SHOPIFY_STORE_DOMAIN`, `SHOPIFY_API_VERSION`, `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `SYNC_TTL_SECONDS`, `REPORT_TIMEZONE` live only in a **gitignored `.env`**; a committed `.env.example` documents them.
 - **Read path (agent):** Supabase MCP hosted server via **OAuth** — the teammate logs in once in the browser; **no key stored anywhere**. `.mcp.json` holds only the non-secret `project_ref` + `read_only=true`, so it is safe to commit and "just works" when the repo is opened.
-- **PII:** we store customer email/name because it is fake dev-store data; documented and easy to drop.
+- **Agent Bash is allow-listed** to exactly `npm run sync` (± `--force`). Combined with the read-only MCP role, the agent genuinely cannot write to the DB — it can only *trigger* the reviewed ETL. This closes the "read-only agent secretly holds a write path" hole raised in review.
+- **Shopify scopes:** the custom app requests `read_products`, `read_orders`, `read_all_orders` (for >60-day history), `read_customers`. Documented in `.env.example`/README so setup is explicit.
+- **PII:** we store customer email/name because it is fake dev-store data; documented and easy to drop. (A stricter PII-free read view for the agent is noted as a future hardening in §11.)
 - **MCP caveats (from research):** headless PAT fallback is account-wide; prompt-injection is the top residual risk. Mitigated via OAuth + read-only role + agent injection guardrail.
 
 ## 8. Error handling & reliability
 
 - **Config:** missing/invalid env → single clear error, exit non-zero, no partial run.
-- **Shopify:** cursor pagination to completion; exponential backoff on throttling/`429`/`5xx`; clear error on auth failure.
-- **Upsert:** batched, FK-ordered; failed batch retried; idempotency makes a re-run after partial failure safe.
+- **Shopify:** cursor pagination to completion; cost/throttle-aware backoff (falls back to `429`/`Retry-After`/`5xx`); clear error on auth/scope failure. If `read_all_orders` is absent, history is labelled "last 60 days" rather than silently truncated.
+- **Currency:** if more than one order currency is seen, the sync fails/warns loudly rather than summing incomparable money.
+- **Upsert:** batched, FK-ordered, per-entity transactional; failed batch retried; idempotency makes a re-run after partial failure safe; `last_synced_at` is stamped only on full success.
 - **Sync failure during a read:** the agent/report proceed on last-good data **and clearly flag** that the refresh failed and show `last_synced_at` — never silently present stale data as fresh, never block the answer entirely.
-- **Report/agent on empty data:** show `0` / "no data found" — never fabricate.
+- **Report/agent on empty data:** show `0` / "no data found" — never fabricate. Distinguish `0` from `NULL` (empty aggregate) explicitly.
+- **Non-technical error surfacing:** failures print a short plain-language line ("Couldn't reach Shopify — check the token in .env") plus the technical detail, so a non-technical teammate knows what to do.
 
 ## 9. Testing
 
-- **Unit (pure, high-value):** `transform` (GID→id extraction, price range from variants, line-item mapping, nullable fields, dangling product refs) and `time` (day/week boundaries, timezone, week-start edges). Table-driven.
-- **E2E (once credentials provided):** (1) run sync, assert row counts vs store; (2) run again, counts unchanged → idempotency; (3) run report, eyeball vs admin; (4) ask agent "how many orders this week", confirm it equals a manual `SELECT COUNT(*)`; (5) confirm a second question within the TTL does **not** re-pull.
+- **Unit (pure, high-value):** `transform` (GID→id extraction, price range from variants, line-item mapping, `shopMoney`/refund/`test` handling, nullable fields, dangling product refs) and `time` label helpers. Table-driven.
+- **Metric-layer tests (against a test DB):** seed known rows and assert `orders_valid` nets refunds and drops test/cancelled orders, and that `store_week_range()`/`weekly_metrics` land on the right Monday-anchored, timezone-correct window (incl. a Sunday-night boundary case). This is where the "no wrong-window" guarantee is actually verified.
+- **E2E (once credentials provided):** (1) run sync, assert row counts vs store; (2) run again, counts unchanged → idempotency; (3) run report, reconcile revenue vs admin **including a refunded order**; (4) ask agent "how many orders this week" and confirm it equals the `weekly_metrics` view / a manual count; (5) confirm a second question within the TTL does **not** re-pull.
 
 ## 10. Out of scope (YAGNI)
 
-Webhooks/real-time sync; hard-delete reconciliation; incremental `updated_at_min` sync; multi-store; RLS/multi-tenant; dashboards; actual cron scheduling (report is cron-*ready*).
+Webhooks/real-time sync; incremental `updated_at_min` sync; multi-store; RLS/multi-tenant; dashboards; actual cron scheduling (report is cron-*ready*).
 
-## 11. Open trade-offs (acknowledged)
+## 11. Open trade-offs & deferred hardening (acknowledged)
 
+Applied from the adversarial review (`docs/design-review-grill.md`): metric views/functions as single source of truth, refund-netting + test-order exclusion, single-currency assertion, `shopMoney`, agent Bash allow-list, advisory-lock + transactional sync, `read_all_orders` scope + 60-day labelling, "all math in SQL" for the agent.
+
+**Deferred as documented limitations (safe at dev-store scale):**
+- **Hard-delete reconciliation (orphan rows).** An order/product deleted in Shopify lingers in Supabase and would still be counted. Deferred; the clean fix is a mark-and-sweep (stamp a `seen` marker each full sync, soft-delete rows not seen). Called out so a demo isn't surprised.
+- **PII-free agent view.** The agent can currently `SELECT` customer email/name; a dedicated PII-free view for the read-only role is the stricter posture. Deferred (fake dev data).
+- **Nested pagination > 250.** A single product with >250 variants or a single order with >250 line items is not sub-paginated. Deferred — unreachable at dev-store scale; noted so it isn't mistaken for handled.
+
+**Trade-offs we keep:**
 - **Full vs incremental sync** — full, for simplicity at dev-store scale.
 - **Staleness TTL vs always-pull** — a TTL (default 300s) balances "fresh data" against latency/rate-limits; `--force` bypasses it.
-- **Service key for report reads** — SELECT-only trusted code; acceptable unlike the LLM agent, which gets the read-only role.
+- **Service key for report reads** — SELECT-only trusted code; acceptable unlike the LLM agent, which gets the read-only role. (A dedicated read-only key would be stricter.)
 - **`project_ref` committed in `.mcp.json`** — non-secret; committing maximizes "just works". `${SUPABASE_PROJECT_REF}` interpolation is the stricter alternative.
-- **Agent triggers a write process** — it can run the trusted ETL but cannot write via MCP; the "read-only agent" property is preserved at the credential layer.
+- **Agent triggers a write process** — it can run *only* the allow-listed trusted ETL and cannot write via MCP; the "read-only agent" property is preserved at the credential layer.
