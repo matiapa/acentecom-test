@@ -19,8 +19,14 @@ export async function fetchSyncData(client: ShopifyClient): Promise<SyncData> {
     data.orders.push(toOrderRow(node));
     data.lineItems.push(...toLineItemRows(node));
   }
-  for await (const node of client.paginate<any>(CUSTOMERS_QUERY, "customers")) {
-    data.customers.push(toCustomerRow(node));
+  // Customers may be entirely inaccessible on dev/free Shopify plans (PII gating).
+  // Treat that as non-fatal: the core deliverable (products + orders) must still sync.
+  try {
+    for await (const node of client.paginate<any>(CUSTOMERS_QUERY, "customers")) {
+      data.customers.push(toCustomerRow(node));
+    }
+  } catch (err) {
+    console.warn(`Skipping customers (not accessible on this Shopify plan): ${(err as Error).message.slice(0, 140)}`);
   }
   return data;
 }

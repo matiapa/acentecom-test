@@ -19,7 +19,7 @@ query Orders($cursor: String) {
   orders(first: 50, after: $cursor, sortKey: CREATED_AT) {
     pageInfo { hasNextPage endCursor }
     nodes {
-      id name email test createdAt processedAt updatedAt cancelledAt
+      id name test createdAt processedAt updatedAt cancelledAt
       displayFinancialStatus displayFulfillmentStatus
       customer { id }
       currentSubtotalPriceSet { shopMoney { amount currencyCode } }
@@ -39,12 +39,16 @@ query Orders($cursor: String) {
   }
 }`;
 
+// Note: customer PII (email, firstName, lastName) is only accessible on paid Shopify
+// plans; development stores return ACCESS_DENIED for it. We therefore request only
+// non-PII customer fields here, and fetchSyncData tolerates the Customer object being
+// denied entirely (dev store) by skipping customers rather than failing the sync.
 export const CUSTOMERS_QUERY = `
 query Customers($cursor: String) {
   customers(first: 100, after: $cursor) {
     pageInfo { hasNextPage endCursor }
     nodes {
-      id email firstName lastName numberOfOrders state createdAt updatedAt
+      id numberOfOrders state createdAt updatedAt
       amountSpent { amount currencyCode }
     }
   }
