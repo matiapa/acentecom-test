@@ -63,3 +63,46 @@ export function toCustomerRow(node: any): CustomerRow {
     updated_at: node.updatedAt,
   };
 }
+
+import type { OrderRow, LineItemRow } from "./types.js";
+
+const shopMoney = (set: any): number | null => money(set?.shopMoney);
+
+export function toOrderRow(node: any): OrderRow {
+  return {
+    shopify_id: gidToId(node.id)!,
+    name: node.name,
+    customer_id: gidToId(node.customer?.id),
+    email: node.email ?? null,
+    financial_status: lower(node.displayFinancialStatus),
+    fulfillment_status: lower(node.displayFulfillmentStatus),
+    currency: node.totalPriceSet?.shopMoney?.currencyCode ?? "",
+    test: Boolean(node.test),
+    subtotal_price: shopMoney(node.currentSubtotalPriceSet),
+    total_tax: shopMoney(node.totalTaxSet),
+    total_discounts: shopMoney(node.totalDiscountsSet),
+    total_refunded: shopMoney(node.totalRefundedSet),
+    total_price: shopMoney(node.totalPriceSet),
+    created_at: node.createdAt,
+    processed_at: node.processedAt ?? null,
+    updated_at: node.updatedAt,
+    cancelled_at: node.cancelledAt ?? null,
+  };
+}
+
+export function toLineItemRows(orderNode: any): LineItemRow[] {
+  const orderId = gidToId(orderNode.id)!;
+  const nodes = orderNode.lineItems?.nodes ?? [];
+  return nodes.map((li: any) => ({
+    shopify_id: gidToId(li.id)!,
+    order_id: orderId,
+    product_id: gidToId(li.product?.id),
+    variant_id: gidToId(li.variant?.id),
+    title: li.title ?? null,
+    variant_title: li.variantTitle ?? null,
+    sku: li.sku ?? null,
+    quantity: li.quantity,
+    price: shopMoney(li.originalUnitPriceSet),
+    total_discount: shopMoney(li.totalDiscountSet),
+  }));
+}

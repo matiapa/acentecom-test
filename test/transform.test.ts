@@ -52,3 +52,45 @@ test("toCustomerRow maps names and amountSpent", () => {
     total_spent: 50, state: "enabled", created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z",
   });
 });
+
+import { toOrderRow, toLineItemRows } from "../src/transform.js";
+
+const orderNode = {
+  id: "gid://shopify/Order/100", name: "#1001", email: "c@d.com", test: false,
+  displayFinancialStatus: "PARTIALLY_REFUNDED", displayFulfillmentStatus: "FULFILLED",
+  createdAt: "2026-01-05T00:00:00Z", processedAt: "2026-01-05T00:00:00Z",
+  updatedAt: "2026-01-06T00:00:00Z", cancelledAt: null,
+  customer: { id: "gid://shopify/Customer/7" },
+  currentSubtotalPriceSet: { shopMoney: { amount: "40.00", currencyCode: "USD" } },
+  totalTaxSet: { shopMoney: { amount: "4.00", currencyCode: "USD" } },
+  totalDiscountsSet: { shopMoney: { amount: "0.00", currencyCode: "USD" } },
+  totalRefundedSet: { shopMoney: { amount: "10.00", currencyCode: "USD" } },
+  totalPriceSet: { shopMoney: { amount: "44.00", currencyCode: "USD" } },
+  lineItems: { nodes: [{
+    id: "gid://shopify/LineItem/500", title: "Tee", variantTitle: "S", sku: "T-S", quantity: 2,
+    product: { id: "gid://shopify/Product/1" }, variant: { id: "gid://shopify/ProductVariant/9" },
+    originalUnitPriceSet: { shopMoney: { amount: "20.00" } },
+    totalDiscountSet: { shopMoney: { amount: "0.00" } },
+  }] },
+};
+
+test("toOrderRow reads shopMoney, refund, test, currency, lowercases statuses", () => {
+  expect(toOrderRow(orderNode)).toEqual({
+    shopify_id: 100, name: "#1001", customer_id: 7, email: "c@d.com",
+    financial_status: "partially_refunded", fulfillment_status: "fulfilled", currency: "USD",
+    test: false, subtotal_price: 40, total_tax: 4, total_discounts: 0, total_refunded: 10,
+    total_price: 44, created_at: "2026-01-05T00:00:00Z", processed_at: "2026-01-05T00:00:00Z",
+    updated_at: "2026-01-06T00:00:00Z", cancelled_at: null,
+  });
+});
+
+test("toLineItemRows links order/product/variant and handles missing product", () => {
+  expect(toLineItemRows(orderNode)[0]).toEqual({
+    shopify_id: 500, order_id: 100, product_id: 1, variant_id: 9, title: "Tee",
+    variant_title: "S", sku: "T-S", quantity: 2, price: 20, total_discount: 0,
+  });
+  const deleted = { ...orderNode, lineItems: { nodes: [{ ...orderNode.lineItems.nodes[0], product: null, variant: null }] } };
+  const r = toLineItemRows(deleted)[0];
+  expect(r.product_id).toBe(null);
+  expect(r.variant_id).toBe(null);
+});
